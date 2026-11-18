@@ -1,0 +1,216 @@
+"""Poblacion, etiqueta y variables de entrada con corte temporal explicito.
+
+Para cada episodio, t_k = fecha_inicio + k semanas es el momento de la prediccion:
+
+- Variables de entrada: SOLO informacion con fecha <= t_k. Un ciclo vencido antes de
+  t_k pero pagado despues se ve como "sin pagar" con el atraso acumulado hasta t_k,
+  porque eso es lo que se sabria ese dia.
+- Etiqueta: ciclos con vencimiento en (t_k, t_k + H semanas]. Vale 1 si alguno llega a
+  X o mas dias de atraso, o si nunca se pago porque el episodio se cerro antes.
+
+Ver docs/reglas_de_negocio.md.
+"""
+import numpy as np
+import pandas as pd
+
+from ciclos import CARTAS_RETIRO
+
+ENFERMEDAD = {"ENFERMO", "FAMILIAR MUERTO"}
+INMOVILIZACION = {"VARADO", "ACIDENTADO", "PATIO", "PATIOS", "FISCALIA", "EN TALLER", "GARANTIA", "GARANTÍA"}
+RETENCION = {"MOTO INGRESADA"}
+PROBLEMA = {"PROBLEMA"}
+
+
+def asignar_retiro(episodios, retiros, gracia_dias=30):
+    """Primera carta de retiro dentro del episodio (o hasta `gracia_dias` despues de
+    su fin, porque la carta se registra unos dias despues de quitar la moto)."""
+    m = episodios[["id_episodio", "id_contrato", "fecha_inicio", "fin"]].merge(retiros, on="id_contrato")
+    m = m[(m.fecha >= m.fecha_inicio) & (m.fecha <= m.fin + pd.Timedelta(days=gracia_dias))]
+    m = m.sort_values("fecha").drop_duplicates("id_episodio")
+    m = m.rename(columns={"fecha": "fecha_retiro", "motivo": "motivo_retiro"})
+    return episodios.merge(m[["id_episodio", "fecha_retiro", "motivo_retiro"]], how="left")
+
+
+def _cierre_ambiguo(ep, ciclos, k, h, x):
+    """Episodios cerrados con algun ciclo del horizonte sin pagar y ninguno con x o mas
+    dias de atraso, que ademas no terminaron con una carta de retiro por mal comportamiento."""
+    c = _semana(ciclos[ciclos.id_episodio.isin(ep.id_episodio)], ep)
+    c = c[(c.semana > k) & (c.semana <= k + h)]
+    sin_pagar = (~c.pagado & c.cerrado).groupby(c.id_episodio).any()
+    grave = (c.dias_atraso >= x).groupby(c.id_episodio).any()
+    con_carta = ep.set_index("id_episodio").motivo_retiro.isin(CARTAS_RETIRO)
+    amb = sin_pagar & ~grave & ~con_carta.reindex(sin_pagar.index, fill_value=False)
+    return amb[amb].index
+
+
+def marcar_poblacion(episodios, ciclos, k, h, x, corte, inicio_cohorte):
+    """Clasifica cada episodio segun si entra al modelo supervisado y por que no.
+
+    `motivo_exclusion` vale None para los episodios de la poblacion.
+    """
+    ep = episodios.copy()
+    con_pago = set(ciclos.loc[ciclos.pagado, "id_episodio"])
+    ep["semanas"] = (ep.fin - ep.fecha_inicio).dt.days / 7
+    ep["cerrado"] = ep.fin < corte - pd.Timedelta(days=3)
+    t_k = ep.fecha_inicio + pd.Timedelta(weeks=k)
+    t_h = ep.fecha_inicio + pd.Timedelta(weeks=k + h)
+    reglas = [
+        # El orden importa: cada episodio queda con el primer motivo que cumple
+        ("inicio antes de la cohorte", ep.fecha_inicio < inicio_cohorte),
+        ("error de asignacion (<= 1 semana sin pagos)", (ep.semanas <= 1) & ~ep.id_episodio.isin(con_pago)),
+        ("sin dia_canon", (ep.tipopago == "SEMANAL") & ep.dia_canon_num.isna()),
+        ("cerrado antes de la semana k", ep.fin <= t_k),
+        # El desenlace se conoce si el horizonte (mas x dias para ver el atraso del
+        # ultimo ciclo) ya paso, o si el episodio se cerro dentro del horizonte
+        ("sin desenlace observable aun", ~((t_h + pd.Timedelta(days=x) <= corte) | (ep.cerrado & (ep.fin <= t_h)))),
+        # Cerro con un ciclo del horizonte sin pagar, pero con menos de x dias de atraso
+        # y sin carta de retiro por mal comportamiento: el atraso quedo censurado y
+        # no hay evidencia de que haya sido grave (ni de que no lo fuera)
+        ("cierre con atraso censurado sin carta de retiro", ep.id_episodio.isin(_cierre_ambiguo(ep, ciclos, k, h, x))),
+    ]
+    ep["motivo_exclusion"] = None
+    for motivo, cond in reglas:
+        ep.loc[ep.motivo_exclusion.isna() & cond, "motivo_exclusion"] = motivo
+    return ep
+
+
+def _semana(ciclos, episodios):
+    c = ciclos.merge(episodios[["id_episodio", "fecha_inicio", "cerrado"]], on="id_episodio")
+    c["semana"] = (c.fecha_esperada - c.fecha_inicio).dt.days / 7
+    return c
+
+
+def etiqueta(poblacion, ciclos, k, h, x):
+    """1 = riesgo grave de mora: algun ciclo que vence en (k, k+h] semanas alcanza x o
+    mas dias de atraso, o quedo sin pagar al cerrarse el episodio con una carta de retiro
+    por mal comportamiento. Los cierres sin carta y con atraso menor a x dias quedan fuera
+    de la poblacion (ver `marcar_poblacion`), porque su desenlace no es observable."""
+    c = _semana(ciclos[ciclos.id_episodio.isin(poblacion.id_episodio)], poblacion)
+    c = c[(c.semana > k) & (c.semana <= k + h)]
+    con_carta = poblacion.set_index("id_episodio").motivo_retiro.isin(CARTAS_RETIRO)
+    nunca_pagado = ~c.pagado & c.cerrado & c.id_episodio.map(con_carta).fillna(False).astype(bool)
+    c["grave"] = (c.dias_atraso >= x) | nunca_pagado
+    y = c.groupby("id_episodio").grave.any()
+    return y.reindex(poblacion.id_episodio, fill_value=False).astype(int).rename("y")
+
+
+def _eventos(diario_ep, valores):
+    """Cuenta tramos de dias consecutivos con una justificacion del grupo."""
+    d = diario_ep[diario_ep.just.isin(valores)].sort_values(["id_episodio", "fecha_registro"])
+    if d.empty:
+        return pd.Series(dtype=int)
+    salto = d.groupby("id_episodio").fecha_registro.diff().dt.days.ne(1)
+    return salto.groupby(d.id_episodio).sum().astype(int)
+
+
+def _pendiente_atraso(d):
+    """Pendiente (dias de atraso por semana) del atraso de cada ciclo contra su semana."""
+    if len(d) < 3 or d.semana.nunique() < 2:
+        return np.nan
+    return np.polyfit(d.semana, d.atraso_k, 1)[0]
+
+
+def variables_entrada(poblacion, ciclos, pagos, diario, k):
+    """Variables de comportamiento de las primeras k semanas de cada episodio."""
+    pob = poblacion.set_index("id_episodio")
+    t_k = pob.fecha_inicio + pd.Timedelta(weeks=k)
+
+    # Ciclos vencidos hasta t_k, vistos como se verian en t_k
+    c = _semana(ciclos[ciclos.id_episodio.isin(pob.index)], poblacion)
+    c = c[c.semana <= k].copy()
+    c["t_k"] = c.id_episodio.map(t_k)
+    c["pagado_k"] = c.pagado & (c.fecha_pago <= c.t_k)
+    c["atraso_k"] = np.where(c.pagado_k, c.dias_atraso, (c.t_k - c.fecha_esperada).dt.days.clip(lower=0))
+    g = c.groupby("id_episodio")
+    tabla = pd.DataFrame({
+        "ciclos_esperados": g.size(),
+        "prop_ciclos_atrasados": g.atraso_k.apply(lambda s: (s > 0).mean()),
+        "prop_ciclos_atraso_3mas": g.atraso_k.apply(lambda s: (s >= 3).mean()),
+        "atraso_promedio": g.atraso_k.mean(),
+        "atraso_maximo": g.atraso_k.max(),
+        "ciclos_sin_pagar_k": g.pagado_k.apply(lambda s: (~s).sum()),
+    })
+
+    # Pagos del episodio en [fecha_inicio, t_k]
+    p = pagos.merge(poblacion[["id_episodio", "id_contrato", "fecha_inicio"]], on="id_contrato")
+    p = p[(p.fecha >= p.fecha_inicio) & (p.fecha <= p.id_episodio.map(t_k))]
+    p["canon"] = p.abono + p.transf
+    gp = p.groupby("id_episodio")
+    tabla["dias_con_pago"] = gp.size()
+    tabla["dias_hasta_primer_pago"] = (gp.fecha.min() - pob.fecha_inicio).dt.days
+    tabla["pago_canon_total"] = gp.canon.sum()
+    tabla["cv_pago_canon"] = gp.canon.std() / gp.canon.mean()
+    tabla["multa_acumulada"] = gp.multa.sum()
+    tabla["prop_pagos_con_multa"] = gp.multa.apply(lambda s: (s > 0).mean())
+    tabla["repuesto_acumulado"] = gp.repuesto.sum()
+    # Trayectoria: como termina la ventana, no solo el promedio (todo con fecha <= t_k)
+    ult = c[c.semana > k - 2]
+    gu = ult.groupby("id_episodio")
+    tabla["atraso_ult2sem"] = gu.atraso_k.mean()
+    tabla["ciclos_sin_pagar_ult2sem"] = gu.pagado_k.apply(lambda s: (~s).sum())
+    ordenado = c.sort_values(["id_episodio", "fecha_esperada"])
+    tabla["atraso_ultimo_ciclo"] = ordenado.groupby("id_episodio").atraso_k.last()
+    tabla["tendencia_atraso"] = g.apply(_pendiente_atraso, include_groups=False)
+    tabla["desv_atraso"] = g.atraso_k.std()
+    mitad = c.semana > k / 2
+    tabla["cambio_atraso"] = c[mitad].groupby("id_episodio").atraso_k.mean() - c[~mitad].groupby("id_episodio").atraso_k.mean()
+    ult_pago = p.groupby("id_episodio").fecha.max()
+    tabla["dias_desde_ultimo_pago"] = (pob.index.to_series().map(t_k) - ult_pago.reindex(pob.index)).dt.days
+    huecos = p.sort_values(["id_episodio", "fecha"]).groupby("id_episodio").fecha.apply(lambda s: s.diff().dt.days.max())
+    tabla["max_dias_sin_pagar"] = huecos
+    p_ult = p[p.fecha > p.id_episodio.map(t_k) - pd.Timedelta(weeks=2)]
+    tabla["pago_canon_ult2sem"] = p_ult.groupby("id_episodio").canon.sum()
+    tabla = tabla.reindex(pob.index)
+    tabla["pago_canon_ult2sem"] = tabla.pago_canon_ult2sem.fillna(0)
+    for col in ("dias_con_pago", "pago_canon_total", "multa_acumulada", "repuesto_acumulado"):
+        tabla[col] = tabla[col].fillna(0)  # sin pagos en la ventana: 0 real, no faltante
+    tabla["pagos_por_ciclo"] = tabla.dias_con_pago / tabla.ciclos_esperados
+    tabla["deficit_relativo"] = 1 - tabla.pago_canon_total / (pob.cuota * tabla.ciclos_esperados)
+
+    # Justificaciones y marcas de gestion vigentes en [fecha_inicio, t_k]
+    d = diario[["id_contrato", "fecha_registro", "justificacion"]].merge(
+        poblacion[["id_episodio", "id_contrato", "fecha_inicio"]], on="id_contrato")
+    d = d[(d.fecha_registro >= d.fecha_inicio) & (d.fecha_registro <= d.id_episodio.map(t_k))]
+    d["just"] = d.justificacion.fillna("").str.strip().str.upper()
+    for nombre, valores in (("justif_enfermedad", ENFERMEDAD), ("justif_inmovilizacion", INMOVILIZACION),
+                            ("retencion_temporal", RETENCION), ("cliente_problema", PROBLEMA)):
+        tabla[nombre] = _eventos(d, valores).reindex(pob.index, fill_value=0)
+
+    # Variables del contrato (conocidas desde el inicio)
+    tabla["tipopago"] = pob.tipopago
+    tabla["empresa"] = pob.empresa
+    tabla["cuota"] = pob.cuota
+    tabla["no_canon"] = pob.no_canon
+    tabla["dia_canon"] = pob.dia_canon.str.upper().str[:3].where(pob.tipopago == "SEMANAL", "QUI")
+    return tabla
+
+
+def variables_gestion(poblacion, justificaciones, gestion, k):
+    """Variables de la gestion de cobranza y de las justificaciones registradas en
+    [fecha_inicio, t_k]. Solo se cuentan eventos con fecha <= t_k. Los estados que la
+    empresa actualiza despues (aprobado/rechazado) se ignoran: se cuenta el evento, no su desenlace."""
+    pob = poblacion.set_index("id_episodio")
+    t_k = pob.fecha_inicio + pd.Timedelta(weeks=k)
+    base = poblacion[["id_episodio", "id_contrato", "fecha_inicio"]]
+    out = pd.DataFrame(index=pob.index)
+
+    j = justificaciones.assign(fecha=pd.to_datetime(justificaciones.fecha)).merge(base, on="id_contrato")
+    j = j[(j.fecha >= j.fecha_inicio) & (j.fecha <= j.id_episodio.map(t_k))]
+    j["concepto"] = j.concepto.fillna("").str.strip().str.upper()
+    out["just_registros"] = j.groupby("id_episodio").size()
+    out["just_nopago"] = j[j.concepto == "NOPAGO"].groupby("id_episodio").size()
+    out["just_incompleto"] = j[j.concepto == "INCOMPLETO"].groupby("id_episodio").size()
+    out["just_multa"] = j[j.justificacion.fillna("").str.strip().str.upper() == "MULTA"].groupby("id_episodio").size()
+
+    g = gestion.assign(fecha=pd.to_datetime(gestion.fecha)).merge(base, on="id_contrato")
+    g = g[(g.fecha >= g.fecha_inicio) & (g.fecha <= g.id_episodio.map(t_k))]
+    g["concepto"] = g.concepto.fillna("").str.strip().str.upper()
+    out["gest_eventos"] = g.groupby("id_episodio").size()
+    for nombre, valores in (
+        ("gest_sin_comunicacion", {"SINCOMUNICACION"}),
+        ("gest_pago_negro", {"PAGONEGRO", "EFECTIVO"}),
+        ("gest_justificada_2veces", {"JUSTIFI2VECES", "NOPAGOURGENTE", "INCUMPLIDO_SYS"}),
+        ("gest_cuotas_dobles", {"CUOTASDOBLES"}),
+    ):
+        out[nombre] = g[g.concepto.isin(valores)].groupby("id_episodio").size()
+    return out.reindex(pob.index).fillna(0)

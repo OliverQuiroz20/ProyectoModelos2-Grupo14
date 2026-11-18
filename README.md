@@ -41,7 +41,7 @@ son confidenciales; para ejecutarlo se usa Entorno de ejecución → Ejecutar to
 
 Flujo completo, de la base de datos al ranking de gestión (generado con archify).
 
-**Versión interactiva** (zoom, recorrido de rutas, tema claro/oscuro): <https://oliverquiroz20.github.io/ProyectoModelos2/>
+**Versión interactiva** (zoom, recorrido de rutas, tema claro/oscuro): <https://oliverquiroz20.github.io/ProyectoModelos2-Grupo14/>
 (se publica con GitHub Pages desde la carpeta `docs/` de la rama `main`; el archivo es `docs/index.html`).
 
 ## Estructura

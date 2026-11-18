@@ -17,3 +17,8 @@ data/anon/
 entregable1_overleaf/
 ProyectoModelos2_Colab/
 herramientas/
+
+# Datos al dia con contratos reales (ranking de gestion): nunca al repo
+data/anon_hoy/
+data/gestion/
+entregable2_overleaf/
